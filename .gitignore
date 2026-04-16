@@ -31,7 +31,12 @@ yarn-error.*
 *.pem
 
 # local env files
+.env
+.env.*
 .env*.local
+!.env.example
+google-service-account.json
+*.p8.json
 
 # typescript
 *.tsbuildinfo
