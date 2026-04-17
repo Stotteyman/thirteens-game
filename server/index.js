@@ -25,6 +25,16 @@ const suitOrder = { clubs: 0, diamonds: 1, hearts: 2, spades: 3 };
 
 const socketsByUser = new Map();
 const roomsRuntime = new Map();
+const PLAYER_STAT_FIELDS = [
+  'games_played',
+  'rounds_won',
+  'losses',
+  'bombs_played',
+  'money_won_cents',
+  'entry_fees_paid_cents',
+  'wagers_paid_cents',
+  'pot_contributed_cents',
+];
 
 function makeDeck() {
   const deck = [];
@@ -123,6 +133,47 @@ async function ensureProfile(user) {
     .select('*')
     .single();
 
+  if (error) throw error;
+  return data;
+}
+
+async function ensurePlayerStatsRow(userId) {
+  const { error } = await supabase
+    .from('player_stats')
+    .upsert({ user_id: userId }, { onConflict: 'user_id' });
+  if (error) throw error;
+}
+
+async function getPlayerStats(userId) {
+  await ensurePlayerStatsRow(userId);
+  const { data, error } = await supabase
+    .from('player_stats')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function incrementPlayerStats(userId, deltas) {
+  await ensurePlayerStatsRow(userId);
+  const current = await getPlayerStats(userId);
+
+  const updatePatch = {};
+  for (const field of PLAYER_STAT_FIELDS) {
+    const delta = Number(deltas[field] || 0);
+    if (!Number.isFinite(delta) || delta === 0) continue;
+    updatePatch[field] = Number(current[field] || 0) + delta;
+  }
+
+  if (Object.keys(updatePatch).length === 0) return current;
+
+  const { data, error } = await supabase
+    .from('player_stats')
+    .update(updatePatch)
+    .eq('user_id', userId)
+    .select('*')
+    .single();
   if (error) throw error;
   return data;
 }
@@ -336,6 +387,12 @@ async function maybeStartGame(tableId) {
     });
   }
 
+  await Promise.all(
+    runtime.playerOrder.map((userId) =>
+      incrementPlayerStats(userId, { games_played: 1 }),
+    ),
+  );
+
   await broadcastTableState(tableId);
 }
 
@@ -357,8 +414,8 @@ async function settleGame(tableId, winnerId) {
   runtime.standings = standings;
 
   const table = await loadTable(tableId);
-  const winnerMemberships = await loadMemberships(tableId);
-  const winnerStake = winnerMemberships
+  const allMemberships = await loadMemberships(tableId);
+  const winnerStake = allMemberships
     .filter((m) => m.user_id === winnerId)
     .reduce((sum, m) => sum + m.paid_entry_cents + m.paid_wager_cents, 0);
 
@@ -366,6 +423,18 @@ async function settleGame(tableId, winnerId) {
   const payout = Math.min(cap || table.pot_cents, table.pot_cents);
 
   await updateBalance(winnerId, payout);
+
+  await incrementPlayerStats(winnerId, {
+    rounds_won: 1,
+    money_won_cents: payout,
+  });
+
+  const losers = allMemberships.filter((m) => m.role === 'player' && m.user_id !== winnerId);
+  await Promise.all(
+    losers.map((loser) =>
+      incrementPlayerStats(loser.user_id, { losses: 1 }),
+    ),
+  );
 
   await supabase.from('tables').update({ status: 'finished', pot_cents: 0 }).eq('id', tableId);
   await supabase
@@ -517,12 +586,12 @@ function applyPlay(runtime, userId, cardIds) {
 
   const nextHand = runtime.hands.get(userId) || [];
   if (nextHand.length === 0) {
-    return { ok: true, finished: true };
+    return { ok: true, finished: true, comboType: combo.type };
   }
 
   const activeIds = runtime.playerOrder.filter((id) => (runtime.hands.get(id) || []).length > 0);
   runtime.currentTurnId = nextTurn(activeIds, userId);
-  return { ok: true, finished: false };
+  return { ok: true, finished: false, comboType: combo.type };
 }
 
 function applyPass(runtime, userId) {
@@ -664,6 +733,12 @@ async function joinTableAs(user, payload, desiredRole) {
         .update({ pot_cents: (table.pot_cents || 0) + stake })
         .eq('id', table.id);
       table.pot_cents = (table.pot_cents || 0) + stake;
+
+      await incrementPlayerStats(user.id, {
+        entry_fees_paid_cents: table.entry_fee_cents,
+        wagers_paid_cents: wagerForSeat,
+        pot_contributed_cents: stake,
+      });
     }
 
     const nextPaidEntry = alreadyPaid ? existing.paid_entry_cents : table.entry_fee_cents;
@@ -741,14 +816,25 @@ async function requireAuth(req, res, next) {
 app.get('/auth/me', requireAuth, async (req, res) => {
   try {
     const profile = await ensureProfile(req.authUser);
+    const stats = await getPlayerStats(req.authUser.id);
     res.json({
       userId: req.authUser.id,
       email: req.authUser.email,
       displayName: profile.display_name,
       balanceCents: profile.balance_cents,
+      stats,
     });
   } catch (error) {
     res.status(500).json({ error: 'profile_failed', detail: String(error.message || error) });
+  }
+});
+
+app.get('/stats/me', requireAuth, async (req, res) => {
+  try {
+    const stats = await getPlayerStats(req.authUser.id);
+    res.json({ stats });
+  } catch (error) {
+    res.status(500).json({ error: 'stats_failed', detail: String(error.message || error) });
   }
 });
 
@@ -954,6 +1040,10 @@ wss.on('connection', async (socket, req) => {
             .update({ pot_cents: (table.pot_cents || 0) + amountCents })
             .eq('id', tableId);
 
+          await incrementPlayerStats(user.id, {
+            pot_contributed_cents: amountCents,
+          });
+
           await broadcastTableState(tableId);
           return;
         }
@@ -968,6 +1058,11 @@ wss.on('connection', async (socket, req) => {
             sendToUser(user.id, { type: 'error', code: result.code });
             return;
           }
+
+          if (result.comboType === 'bomb') {
+            await incrementPlayerStats(user.id, { bombs_played: 1 });
+          }
+
           if (result.finished) {
             await settleGame(tableId, user.id);
             return;

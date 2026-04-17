@@ -11,7 +11,7 @@
         "simulator": true
       },
       "env": {
-        "EXPO_PUBLIC_SERVER_URL": "http://localhost:8088"
+        "EXPO_PUBLIC_SERVER_URL": "https://your-development-server.com"
       }
     },
     "preview": {

@@ -1,0 +1,8 @@
+[build]
+command = "npx expo export --platform web --clear"
+publish = "dist"
+
+[build.environment]
+EXPO_PUBLIC_SERVER_URL = "https://cleaning-springer-lol-recruiting.trycloudflare.com"
+EXPO_PUBLIC_SUPABASE_URL = "https://vntucmipivisqmofoycb.supabase.co"
+EXPO_PUBLIC_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZudHVjbWlwaXZpc3Ftb2ZveWNiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYzNzM5NDMsImV4cCI6MjA5MTk0OTk0M30.QftNKY5CbzjNBvs9Lzm7zEernPpPWfwVaNN_593alRY"

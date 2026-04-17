@@ -44,3 +44,6 @@ google-service-account.json
 # generated native folders
 /ios
 /android
+
+# Local Netlify folder
+.netlify

@@ -131,7 +131,10 @@ type MockRoom = {
 
 // â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-const DEMO_SERVER = process.env.EXPO_PUBLIC_SERVER_URL ?? 'http://localhost:8088';
+const DEMO_SERVER = (process.env.EXPO_PUBLIC_SERVER_URL ?? '').trim();
+if (!DEMO_SERVER) {
+  throw new Error('Missing EXPO_PUBLIC_SERVER_URL. Configure a hosted backend URL before starting the app.');
+}
 const SUPABASE_REDIRECT_URI = 'thirteens://auth';
 const HUMAN_ID = 'human';
 
