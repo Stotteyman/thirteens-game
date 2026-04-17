@@ -38,7 +38,7 @@
     "web": {
       "favicon": "./assets/favicon.png",
       "bundler": "metro",
-      "output": "static",
+      "output": "single",
       "name": "Tien Len",
       "shortName": "TienLen",
       "lang": "en",
@@ -53,6 +53,9 @@
       "eas": {
         "projectId": "replace-with-your-eas-project-id"
       }
-    }
+    },
+    "plugins": [
+      "expo-web-browser"
+    ]
   }
 }

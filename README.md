@@ -1,101 +1,119 @@
-# Tien Len Wager (Instant In-Game, Low-Cost Cashout)
+# Tien Len Online
 
-This project is a hybrid model designed for:
+Cross-platform Tien Len game built with Expo + React Native + Supabase.
 
-- Instant and free transfers during gameplay (off-chain internal ledger)
-- Low-cost cashouts to blockchain wallets (batched L2 relayer flow)
-- 4-player realtime Tien Len rooms over WebSocket
+Current status:
 
-## What is implemented
+- Supabase OAuth sign-in (Google)
+- Supabase-backed table, seat, balance, and tournament persistence
+- 4-seat realtime gameplay via WebSocket server
+- Spectator support and spectator pot contributions
+- Web build support for browser play
+- Android build profile in EAS for Play Store `.aab`
 
-- Expo app with real cards and animations
-- Realtime multiplayer rooms (4 players)
-- Server-authoritative game rules and turn validation
-- Rule: winner can only receive up to 2x winner stake
-- If pot is smaller than 2x winner stake, winner gets full pot
-- Internal wallet balance ledger for instant in-game settlement
-- Cashout quote/request APIs with low-fee L2 model
-- Solidity escrow contract stub for production ledger + withdrawal flow
+## Stack
 
-## Architecture
+- App: Expo / React Native / TypeScript
+- Backend: Node.js + Express + WebSocket
+- Database/Auth: Supabase Postgres + Supabase Auth
 
-1. Deposit once on-chain (USDC on low-fee chain like Base)
-2. Move value instantly in-game via internal ledger (free, no gas)
-3. Cashout only when needed, batched by relayer to reduce fees
+## Environment variables
 
-This avoids gas costs during every hand while still allowing real wallet withdrawals.
+Create `.env` from `.env.example` and set:
 
-## Run locally
+- `EXPO_PUBLIC_SERVER_URL`
+- `EXPO_PUBLIC_SUPABASE_URL`
+- `EXPO_PUBLIC_SUPABASE_ANON_KEY`
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
 
-Open two terminals in the project root.
+Server startup requires `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
 
-Terminal 1:
+## Local development
+
+1. Install dependencies:
+
+```bash
+npm install
+```
+
+2. Run backend:
 
 ```bash
 npm run server
 ```
 
-Terminal 2:
+3. Run Expo app:
 
 ```bash
 npm run start
 ```
 
-Or run both:
+4. Run web preview:
 
 ```bash
-npm run dev:all
+npm run web
 ```
 
-## Connect from phone (Expo Go)
+## Build website for deployment
 
-If using a physical phone, set `Server URL` in the app to your PC LAN IP:
+Generate static web output:
 
-- Example: `http://192.168.1.105:8088`
+```bash
+npm run build:web
+```
 
-`localhost` only works when app and server run on the same host context.
+Output folder: `dist/`
 
-## Wallet auth modes
+Local static preview:
 
-- Quick Demo Connect: signs with a demo signature format for local testing
-- Real signature mode: supports nonce challenge + signature verify flow
+```bash
+npm run preview:web
+```
 
-For production WalletConnect UX, connect your wallet SDK to sign this exact challenge message:
+## Deploy website
 
-`Sign in to Tien Len: <nonce>`
+You can deploy `dist/` to providers like Vercel, Netlify, Cloudflare Pages, or GitHub Pages.
 
-Then submit the signature to `/auth/verify`.
+Important for OAuth:
 
-## Main endpoints
+- Add your deployed site URL to Supabase Auth redirect URLs.
+- Keep native scheme redirect for app builds: `thirteens://auth`
 
-- `POST /auth/challenge`
-- `POST /auth/verify`
-- `GET /wallet/me`
-- `POST /wallet/deposit/mock`
-- `POST /wallet/cashout/quote`
-- `POST /wallet/cashout/request`
-- `WS /ws?token=<jwt>`
+## Publish to GitHub
 
-## Smart contract
+From project root:
 
-Contract file:
+```bash
+git add .
+git commit -m "Prepare web deployment and responsive online play"
+git branch -M main
+git remote add origin https://github.com/<your-user>/<your-repo>.git
+git push -u origin main
+```
 
-- `contracts/TienLenEscrow.sol`
+## Play Store readiness (Android)
 
-The contract supports:
+This project already has EAS config with Android app-bundle build type.
 
-- `deposit(amount)`
-- `settleHand(...)` by operator
-- `withdraw(amount)`
-- `requestCashout(amount)` intent event
+1. Login and initialize EAS (if needed):
 
-Use a low-fee L2 stablecoin deployment for production.
+```bash
+npx eas login
+npx eas build:configure
+```
 
-## Production checklist
+2. Build Android AAB:
 
-- Replace in-memory server state with Redis/Postgres
-- Add anti-collusion checks and hand replay logs
-- Add deterministic shuffling proof or commit-reveal
-- Add WalletConnect mobile signing UI in-app
-- Add relayer worker that calls escrow contract for withdrawals
-- Add rate limiting and auth hardening
+```bash
+npx eas build --platform android --profile production
+```
+
+3. Submit to Play Console (or use `eas submit`).
+
+## UX behavior target
+
+- Phone users on web should get a mobile-first layout matching Expo feel.
+- Desktop users should get a wider, optimized layout.
+
+This repo includes responsive layout behavior in `App.tsx` to support both modes.

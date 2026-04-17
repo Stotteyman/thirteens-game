@@ -1,23 +1,30 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const { WebSocketServer } = require('ws');
 const { createServer } = require('http');
 const { v4: uuidv4 } = require('uuid');
-const jwt = require('jsonwebtoken');
-const { ethers } = require('ethers');
+const { createClient } = require('@supabase/supabase-js');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const PORT = Number(process.env.PORT || 8088);
 const APP_ORIGIN = process.env.APP_ORIGIN || '*';
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+  throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
 
 const suits = ['clubs', 'diamonds', 'hearts', 'spades'];
 const suitOrder = { clubs: 0, diamonds: 1, hearts: 2, spades: 3 };
 
-const nonces = new Map();
-const sessions = new Map();
-const balances = new Map();
-const socketsByPlayer = new Map();
-const rooms = new Map();
+const socketsByUser = new Map();
+const roomsRuntime = new Map();
 
 function makeDeck() {
   const deck = [];
@@ -55,19 +62,15 @@ function findCombo(cards) {
   if (sorted.length === 1) {
     return { type: 'single', strength: sorted[0].rank * 10 + suitOrder[sorted[0].suit] };
   }
-
   if (sorted.length === 2 && unique.length === 1) {
     return { type: 'pair', strength: sorted[0].rank };
   }
-
   if (sorted.length === 3 && unique.length === 1) {
     return { type: 'triple', strength: sorted[0].rank };
   }
-
   if (sorted.length === 4 && unique.length === 1) {
     return { type: 'bomb', strength: sorted[0].rank };
   }
-
   if (sorted.length >= 3 && unique.length === sorted.length && !ranks.includes(15)) {
     for (let i = 1; i < ranks.length; i += 1) {
       if (ranks[i] !== ranks[i - 1] + 1) {
@@ -76,205 +79,407 @@ function findCombo(cards) {
     }
     return { type: 'straight', strength: ranks[ranks.length - 1] };
   }
-
   return null;
 }
 
 function canBeatPlay(nextPlay, currentPlay) {
-  if (!currentPlay) {
-    return true;
-  }
+  if (!currentPlay) return true;
 
   const currentTopRank = sortCards(currentPlay.cards)[currentPlay.cards.length - 1].rank;
   if (nextPlay.type === 'bomb' && currentPlay.type === 'single' && currentTopRank === 15) {
     return true;
   }
-
-  if (nextPlay.type !== currentPlay.type) {
-    return false;
-  }
-
-  if (nextPlay.type === 'straight' && nextPlay.cards.length !== currentPlay.cards.length) {
-    return false;
-  }
-
+  if (nextPlay.type !== currentPlay.type) return false;
+  if (nextPlay.type === 'straight' && nextPlay.cards.length !== currentPlay.cards.length) return false;
   return nextPlay.strength > currentPlay.strength;
 }
 
 function nextTurn(activeIds, fromId) {
   const idx = activeIds.indexOf(fromId);
-  if (idx === -1) {
-    return activeIds[0];
-  }
+  if (idx === -1) return activeIds[0];
   return activeIds[(idx + 1) % activeIds.length];
 }
 
-function requireAuth(req, res, next) {
-  const auth = req.headers.authorization;
-  if (!auth?.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'missing_auth' });
-    return;
-  }
-
-  try {
-    const token = auth.substring(7);
-    const payload = jwt.verify(token, JWT_SECRET);
-    req.playerId = payload.playerId;
-    req.wallet = payload.wallet;
-    next();
-  } catch (error) {
-    res.status(401).json({ error: 'bad_auth' });
-  }
-}
-
-function buildPublicState(room, targetPlayerId) {
-  const players = room.playerOrder.map((id) => {
-    const p = room.players.get(id);
-    const own = id === targetPlayerId;
-    return {
-      playerId: id,
-      name: p.name,
-      wallet: p.wallet,
-      cardsCount: p.cards.length,
-      cards: own ? p.cards : [],
-      entryCents: p.entryCents,
-      wagerCents: p.wagerCents,
-      stakeCents: p.entryCents + p.wagerCents,
-      balanceCents: balances.get(id) || 0,
-    };
-  });
-
-  return {
-    type: 'game_state',
-    roomId: room.id,
-    started: room.started,
-    finished: room.finished,
-    winnerId: room.winnerId,
-    potCents: room.potCents,
-    tablePlay: room.tablePlay,
-    tableLeaderId: room.tableLeaderId,
-    currentTurnId: room.currentTurnId,
-    mustOpenWithThreeClubs: room.mustOpenWithThreeClubs,
-    passes: [...room.passes],
-    players,
-    payout: room.payout,
-  };
-}
-
-function sendToPlayer(playerId, payload) {
-  const socket = socketsByPlayer.get(playerId);
+function sendToUser(userId, payload) {
+  const socket = socketsByUser.get(userId);
   if (socket && socket.readyState === 1) {
     socket.send(JSON.stringify(payload));
   }
 }
 
-function broadcastRoom(room) {
-  room.playerOrder.forEach((id) => {
-    sendToPlayer(id, buildPublicState(room, id));
+async function getUserFromToken(token) {
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return null;
+  return data.user;
+}
+
+async function ensureProfile(user) {
+  const displayName =
+    String(user.user_metadata?.full_name || user.user_metadata?.name || user.email || 'Player').slice(0, 20);
+
+  const { data, error } = await supabase
+    .from('player_profiles')
+    .upsert({ user_id: user.id, display_name: displayName }, { onConflict: 'user_id' })
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+async function loadTable(tableId) {
+  const { data, error } = await supabase.from('tables').select('*').eq('id', tableId).single();
+  if (error) throw error;
+  return data;
+}
+
+async function loadMemberships(tableId) {
+  const { data, error } = await supabase
+    .from('table_memberships')
+    .select('id, table_id, user_id, role, seat_no, paid_entry_cents, paid_wager_cents, contributed_cents, active')
+    .eq('table_id', tableId)
+    .eq('active', true);
+  if (error) throw error;
+  return data || [];
+}
+
+async function listRoomAudience(tableId) {
+  const memberships = await loadMemberships(tableId);
+  const userIds = memberships.map((m) => m.user_id);
+  if (userIds.length === 0) {
+    return [];
+  }
+
+  const { data: profiles, error } = await supabase
+    .from('player_profiles')
+    .select('user_id, display_name, balance_cents')
+    .in('user_id', userIds);
+  if (error) throw error;
+
+  const profilesById = new Map((profiles || []).map((p) => [p.user_id, p]));
+  return memberships.map((m) => {
+    const profile = profilesById.get(m.user_id);
+    return {
+      userId: m.user_id,
+      role: m.role,
+      seatNo: m.seat_no,
+      paidEntryCents: m.paid_entry_cents,
+      paidWagerCents: m.paid_wager_cents,
+      contributedCents: m.contributed_cents,
+      name: profile?.display_name || 'Player',
+      balanceCents: profile?.balance_cents || 0,
+    };
   });
 }
 
-function tryStartRoom(room) {
-  if (room.started || room.playerOrder.length < 4) {
+async function broadcastTableState(tableId) {
+  const table = await loadTable(tableId);
+  const audience = await listRoomAudience(tableId);
+  const runtime = roomsRuntime.get(tableId);
+
+  const players = audience
+    .filter((a) => a.role === 'player')
+    .sort((a, b) => (a.seatNo || 99) - (b.seatNo || 99));
+  const spectators = audience
+    .filter((a) => a.role === 'spectator')
+    .map((s) => ({ userId: s.userId, name: s.name, contributedCents: s.contributedCents }));
+
+  const playerOrder = runtime?.playerOrder || players.map((p) => p.userId);
+  const playersById = new Map(players.map((p) => [p.userId, p]));
+
+  for (const watcher of audience) {
+    const serializedPlayers = playerOrder
+      .filter((id) => playersById.has(id))
+      .map((id) => {
+        const p = playersById.get(id);
+        const hand = runtime?.hands?.get(id) || [];
+        const isSelf = id === watcher.userId;
+        return {
+          userId: id,
+          name: p.name,
+          seatNo: p.seatNo,
+          role: 'player',
+          cardsCount: hand.length,
+          cards: isSelf ? hand : [],
+          paidEntryCents: p.paidEntryCents,
+          paidWagerCents: p.paidWagerCents,
+          stakeCents: p.paidEntryCents + p.paidWagerCents,
+          balanceCents: p.balanceCents,
+          contributedCents: p.contributedCents,
+        };
+      });
+
+    sendToUser(watcher.userId, {
+      type: 'table_state',
+      tableId,
+      started: !!runtime?.started,
+      finished: !!runtime?.finished,
+      winnerId: runtime?.winnerId || null,
+      tableStatus: table.status,
+      potCents: table.pot_cents,
+      currentTurnId: runtime?.currentTurnId || null,
+      tablePlay: runtime?.tablePlay || null,
+      tableLeaderId: runtime?.tableLeaderId || null,
+      mustOpenWithThreeClubs: runtime?.mustOpenWithThreeClubs || false,
+      passes: [...(runtime?.passes || new Set())],
+      meRole: watcher.role,
+      players: serializedPlayers,
+      spectators,
+      tournament: table.tournament_id
+        ? { id: table.tournament_id, bracket: table.bracket, roundNo: table.round_no }
+        : null,
+    });
+  }
+}
+
+async function updateBalance(userId, delta) {
+  const { data: row, error: readErr } = await supabase
+    .from('player_profiles')
+    .select('balance_cents')
+    .eq('user_id', userId)
+    .single();
+  if (readErr) throw readErr;
+
+  const nextBalance = Number(row.balance_cents || 0) + delta;
+  if (nextBalance < 0) {
+    return { ok: false, code: 'insufficient_balance' };
+  }
+
+  const { error: writeErr } = await supabase
+    .from('player_profiles')
+    .update({ balance_cents: nextBalance })
+    .eq('user_id', userId);
+  if (writeErr) throw writeErr;
+
+  return { ok: true, balanceCents: nextBalance };
+}
+
+function createRuntimeForTable(tableId) {
+  const runtime = {
+    tableId,
+    started: false,
+    finished: false,
+    playerOrder: [],
+    hands: new Map(),
+    tablePlay: null,
+    tableLeaderId: null,
+    currentTurnId: null,
+    mustOpenWithThreeClubs: true,
+    passes: new Set(),
+    winnerId: null,
+    standings: null,
+  };
+  roomsRuntime.set(tableId, runtime);
+  return runtime;
+}
+
+function getRuntime(tableId) {
+  return roomsRuntime.get(tableId) || createRuntimeForTable(tableId);
+}
+
+async function maybeStartGame(tableId) {
+  const table = await loadTable(tableId);
+  const runtime = getRuntime(tableId);
+  if (runtime.started && !runtime.finished) return;
+
+  const memberships = await loadMemberships(tableId);
+  const players = memberships
+    .filter((m) => m.role === 'player')
+    .sort((a, b) => (a.seat_no || 99) - (b.seat_no || 99));
+
+  if (players.length !== 4) {
     return;
   }
 
-  for (const playerId of room.playerOrder) {
-    const p = room.players.get(playerId);
-    const stake = p.entryCents + p.wagerCents;
-    const balance = balances.get(playerId) || 0;
-    if (balance < stake) {
-      sendToPlayer(playerId, {
-        type: 'error',
-        code: 'insufficient_balance',
-        message: 'Top up your internal balance to cover stake.',
-      });
-      return;
-    }
-  }
-
-  room.potCents = 0;
-  room.playerOrder.forEach((playerId) => {
-    const p = room.players.get(playerId);
-    const stake = p.entryCents + p.wagerCents;
-    room.potCents += stake;
-    balances.set(playerId, (balances.get(playerId) || 0) - stake);
-  });
-
   const deck = shuffle(makeDeck());
-  room.playerOrder.forEach((playerId, index) => {
-    const hand = sortCards(deck.slice(index * 13, index * 13 + 13));
-    room.players.get(playerId).cards = hand;
+  runtime.playerOrder = players.map((p) => p.user_id);
+  runtime.hands.clear();
+
+  runtime.playerOrder.forEach((userId, index) => {
+    runtime.hands.set(userId, sortCards(deck.slice(index * 13, index * 13 + 13)));
   });
 
-  room.tablePlay = null;
-  room.tableLeaderId = room.playerOrder[0];
-  room.passes.clear();
-  room.mustOpenWithThreeClubs = true;
-  room.started = true;
-  room.finished = false;
-  room.winnerId = null;
-  room.payout = null;
+  runtime.tablePlay = null;
+  runtime.tableLeaderId = runtime.playerOrder[0];
+  runtime.passes.clear();
+  runtime.mustOpenWithThreeClubs = true;
+  runtime.started = true;
+  runtime.finished = false;
+  runtime.winnerId = null;
+  runtime.standings = null;
 
-  const starterId = room.playerOrder.find((id) =>
-    room.players.get(id).cards.some((card) => card.rank === 3 && card.suit === 'clubs'),
+  const starter = runtime.playerOrder.find((id) =>
+    (runtime.hands.get(id) || []).some((c) => c.rank === 3 && c.suit === 'clubs'),
   );
+  runtime.currentTurnId = starter || runtime.playerOrder[0];
 
-  room.currentTurnId = starterId || room.playerOrder[0];
-  broadcastRoom(room);
+  await supabase.from('tables').update({ status: 'in_progress' }).eq('id', tableId);
+
+  const { data: existingGame } = await supabase
+    .from('games')
+    .select('id')
+    .eq('table_id', tableId)
+    .in('status', ['waiting', 'in_progress'])
+    .limit(1)
+    .maybeSingle();
+
+  if (existingGame?.id) {
+    await supabase
+      .from('games')
+      .update({ status: 'in_progress', started_at: new Date().toISOString() })
+      .eq('id', existingGame.id);
+  } else {
+    await supabase.from('games').insert({
+      table_id: tableId,
+      status: 'in_progress',
+      started_at: new Date().toISOString(),
+    });
+  }
+
+  await broadcastTableState(tableId);
 }
 
-function settleRoom(room, winnerId) {
-  const winner = room.players.get(winnerId);
-  const winnerStake = winner.entryCents + winner.wagerCents;
+async function settleGame(tableId, winnerId) {
+  const runtime = getRuntime(tableId);
+  runtime.finished = true;
+  runtime.winnerId = winnerId;
+
+  const standings = runtime.playerOrder
+    .map((userId) => ({ userId, cardsLeft: (runtime.hands.get(userId) || []).length }))
+    .sort((a, b) => a.cardsLeft - b.cardsLeft);
+
+  // Winner should always be first even when cardsLeft ties due to fast finish.
+  standings.sort((a, b) => {
+    if (a.userId === winnerId) return -1;
+    if (b.userId === winnerId) return 1;
+    return a.cardsLeft - b.cardsLeft;
+  });
+  runtime.standings = standings;
+
+  const table = await loadTable(tableId);
+  const winnerMemberships = await loadMemberships(tableId);
+  const winnerStake = winnerMemberships
+    .filter((m) => m.user_id === winnerId)
+    .reduce((sum, m) => sum + m.paid_entry_cents + m.paid_wager_cents, 0);
+
   const cap = winnerStake * 2;
-  const payout = Math.min(cap, room.potCents);
+  const payout = Math.min(cap || table.pot_cents, table.pot_cents);
 
-  balances.set(winnerId, (balances.get(winnerId) || 0) + payout);
+  await updateBalance(winnerId, payout);
 
-  let remainder = room.potCents - payout;
-  const losers = room.playerOrder.filter((id) => id !== winnerId);
-  const losersTotal = losers.reduce((sum, id) => {
-    const p = room.players.get(id);
-    return sum + p.entryCents + p.wagerCents;
-  }, 0);
+  await supabase.from('tables').update({ status: 'finished', pot_cents: 0 }).eq('id', tableId);
+  await supabase
+    .from('games')
+    .update({
+      status: 'finished',
+      winner_user_id: winnerId,
+      standings,
+      finished_at: new Date().toISOString(),
+    })
+    .eq('table_id', tableId)
+    .eq('status', 'in_progress');
 
-  if (remainder > 0 && losersTotal > 0) {
-    losers.forEach((id) => {
-      const p = room.players.get(id);
-      const stake = p.entryCents + p.wagerCents;
-      const share = Math.floor((remainder * stake) / losersTotal);
-      balances.set(id, (balances.get(id) || 0) + share);
-      remainder -= share;
-    });
+  if (table.tournament_id && table.bracket) {
+    await supabase.from('tournament_round_results').upsert(
+      {
+        tournament_id: table.tournament_id,
+        round_no: table.round_no,
+        bracket: table.bracket,
+        table_id: table.id,
+        standings,
+      },
+      { onConflict: 'tournament_id,round_no,bracket' },
+    );
 
-    if (remainder > 0) {
-      const firstLoser = losers[0];
-      balances.set(firstLoser, (balances.get(firstLoser) || 0) + remainder);
-      remainder = 0;
+    const { data: roundResults } = await supabase
+      .from('tournament_round_results')
+      .select('*')
+      .eq('tournament_id', table.tournament_id)
+      .eq('round_no', table.round_no)
+      .eq('processed', false);
+
+    if ((roundResults || []).length === 2) {
+      const winners = roundResults.find((r) => r.bracket === 'winners');
+      const losers = roundResults.find((r) => r.bracket === 'losers');
+
+      if (winners && losers) {
+        const topWinners = winners.standings.slice(0, 2).map((x) => x.userId);
+        const bottomWinners = winners.standings.slice(2, 4).map((x) => x.userId);
+        const topLosers = losers.standings.slice(0, 2).map((x) => x.userId);
+        const bottomLosers = losers.standings.slice(2, 4).map((x) => x.userId);
+
+        const newWinners = [...topWinners, ...topLosers].filter(Boolean);
+        const newLosers = [...bottomLosers, ...bottomWinners].filter(Boolean);
+
+        await supabase
+          .from('table_memberships')
+          .update({ role: 'spectator', seat_no: null })
+          .in('table_id', [winners.table_id, losers.table_id])
+          .eq('active', true)
+          .eq('role', 'player');
+
+        for (let i = 0; i < Math.min(4, newWinners.length); i += 1) {
+          await supabase.from('table_memberships').upsert(
+            {
+              table_id: winners.table_id,
+              user_id: newWinners[i],
+              role: 'player',
+              seat_no: i + 1,
+              active: true,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'table_id,user_id' },
+          );
+        }
+
+        for (let i = 0; i < Math.min(4, newLosers.length); i += 1) {
+          await supabase.from('table_memberships').upsert(
+            {
+              table_id: losers.table_id,
+              user_id: newLosers[i],
+              role: 'player',
+              seat_no: i + 1,
+              active: true,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'table_id,user_id' },
+          );
+        }
+
+        await supabase
+          .from('tables')
+          .update({ status: 'waiting', round_no: table.round_no + 1 })
+          .in('id', [winners.table_id, losers.table_id]);
+
+        await supabase
+          .from('tournaments')
+          .update({ current_round: table.round_no + 1 })
+          .eq('id', table.tournament_id);
+
+        await supabase
+          .from('tournament_round_results')
+          .update({ processed: true })
+          .in(
+            'id',
+            roundResults.map((r) => r.id),
+          );
+      }
     }
   }
 
-  room.finished = true;
-  room.winnerId = winnerId;
-  room.payout = {
-    winnerStakeCents: winnerStake,
-    winnerPayoutCents: payout,
-    capCents: cap,
-    potCents: room.potCents,
-  };
+  await broadcastTableState(tableId);
 }
 
-function applyPlay(room, playerId, cardIds) {
-  if (!room.started || room.finished) {
+function applyPlay(runtime, userId, cardIds) {
+  if (!runtime.started || runtime.finished) {
     return { ok: false, code: 'not_active' };
   }
-  if (room.currentTurnId !== playerId) {
+  if (runtime.currentTurnId !== userId) {
     return { ok: false, code: 'not_your_turn' };
   }
 
-  const player = room.players.get(playerId);
-  const cards = player.cards.filter((c) => cardIds.includes(c.id));
+  const hand = runtime.hands.get(userId) || [];
+  const cards = hand.filter((c) => cardIds.includes(c.id));
   if (cards.length !== cardIds.length) {
     return { ok: false, code: 'cards_not_owned' };
   }
@@ -284,95 +489,229 @@ function applyPlay(room, playerId, cardIds) {
     return { ok: false, code: 'invalid_combo' };
   }
 
-  if (room.mustOpenWithThreeClubs && !cards.some((c) => c.rank === 3 && c.suit === 'clubs')) {
+  if (runtime.mustOpenWithThreeClubs && !cards.some((c) => c.rank === 3 && c.suit === 'clubs')) {
     return { ok: false, code: 'must_open_3_clubs' };
   }
 
   const proposed = {
-    playerId,
+    playerId: userId,
     cards: sortCards(cards),
     type: combo.type,
     strength: combo.strength,
   };
 
-  if (!canBeatPlay(proposed, room.tablePlay)) {
+  if (!canBeatPlay(proposed, runtime.tablePlay)) {
     return { ok: false, code: 'play_too_weak' };
   }
 
   const selected = new Set(cardIds);
-  player.cards = player.cards.filter((c) => !selected.has(c.id));
+  runtime.hands.set(
+    userId,
+    hand.filter((c) => !selected.has(c.id)),
+  );
 
-  room.tablePlay = proposed;
-  room.tableLeaderId = playerId;
-  room.passes.clear();
-  room.mustOpenWithThreeClubs = false;
+  runtime.tablePlay = proposed;
+  runtime.tableLeaderId = userId;
+  runtime.passes.clear();
+  runtime.mustOpenWithThreeClubs = false;
 
-  if (player.cards.length === 0) {
-    settleRoom(room, playerId);
+  const nextHand = runtime.hands.get(userId) || [];
+  if (nextHand.length === 0) {
     return { ok: true, finished: true };
   }
 
-  const activeIds = room.playerOrder.filter((id) => room.players.get(id).cards.length > 0);
-  room.currentTurnId = nextTurn(activeIds, playerId);
+  const activeIds = runtime.playerOrder.filter((id) => (runtime.hands.get(id) || []).length > 0);
+  runtime.currentTurnId = nextTurn(activeIds, userId);
   return { ok: true, finished: false };
 }
 
-function pass(room, playerId) {
-  if (!room.started || room.finished) {
+function applyPass(runtime, userId) {
+  if (!runtime.started || runtime.finished) {
     return { ok: false, code: 'not_active' };
   }
-  if (!room.tablePlay) {
+  if (!runtime.tablePlay) {
     return { ok: false, code: 'cannot_pass_open_table' };
   }
-  if (room.currentTurnId !== playerId) {
+  if (runtime.currentTurnId !== userId) {
     return { ok: false, code: 'not_your_turn' };
   }
 
-  room.passes.add(playerId);
-  const activeOthers = room.playerOrder.filter(
-    (id) => id !== room.tableLeaderId && room.players.get(id).cards.length > 0,
+  runtime.passes.add(userId);
+  const activeOthers = runtime.playerOrder.filter(
+    (id) => id !== runtime.tableLeaderId && (runtime.hands.get(id) || []).length > 0,
   );
 
-  if (activeOthers.every((id) => room.passes.has(id))) {
-    room.tablePlay = null;
-    room.passes.clear();
-    room.currentTurnId = room.tableLeaderId;
+  if (activeOthers.every((id) => runtime.passes.has(id))) {
+    runtime.tablePlay = null;
+    runtime.passes.clear();
+    runtime.currentTurnId = runtime.tableLeaderId;
     return { ok: true };
   }
 
-  const activeIds = room.playerOrder.filter((id) => room.players.get(id).cards.length > 0);
-  room.currentTurnId = nextTurn(activeIds, playerId);
+  const activeIds = runtime.playerOrder.filter((id) => (runtime.hands.get(id) || []).length > 0);
+  runtime.currentTurnId = nextTurn(activeIds, userId);
   return { ok: true };
 }
 
-function createRoom(stakeKey) {
-  const room = {
-    id: uuidv4(),
-    stakeKey,
-    started: false,
-    finished: false,
-    playerOrder: [],
-    players: new Map(),
-    potCents: 0,
-    tablePlay: null,
-    tableLeaderId: null,
-    currentTurnId: null,
-    mustOpenWithThreeClubs: true,
-    passes: new Set(),
-    winnerId: null,
-    payout: null,
-  };
-  rooms.set(room.id, room);
-  return room;
+async function findOrCreateOpenTable(entryCents, wagerCents, isPrivate = false, roomCode = null) {
+  const minWager = entryCents > 0 ? Math.max(entryCents * 2, wagerCents) : 0;
+
+  let query = supabase
+    .from('tables')
+    .select('*')
+    .eq('status', 'waiting')
+    .eq('is_private', !!isPrivate)
+    .eq('entry_fee_cents', entryCents)
+    .eq('min_wager_cents', minWager)
+    .is('tournament_id', null)
+    .limit(1);
+
+  if (isPrivate && roomCode) {
+    query = query.eq('room_code', roomCode.toUpperCase());
+  }
+
+  const { data: existing } = await query;
+  if (existing && existing.length > 0) return existing[0];
+
+  const name = isPrivate ? `Private ${roomCode || uuidv4().slice(0, 6).toUpperCase()}` : `Public ${moneyLabel(entryCents, minWager)}`;
+  const code = isPrivate ? (roomCode || uuidv4().slice(0, 6)).toUpperCase() : null;
+
+  const { data: created, error } = await supabase
+    .from('tables')
+    .insert({
+      name,
+      is_private: isPrivate,
+      room_code: code,
+      entry_fee_cents: entryCents,
+      min_wager_cents: minWager,
+      status: 'waiting',
+      seat_count: 4,
+    })
+    .select('*')
+    .single();
+
+  if (error) throw error;
+  return created;
 }
 
-function findOpenRoom(stakeKey) {
-  for (const room of rooms.values()) {
-    if (room.stakeKey === stakeKey && !room.started && room.playerOrder.length < 4) {
-      return room;
+function moneyLabel(entry, wager) {
+  return `$${(entry / 100).toFixed(2)} / $${(wager / 100).toFixed(2)}`;
+}
+
+async function joinTableAs(user, payload, desiredRole) {
+  const role = desiredRole === 'spectator' ? 'spectator' : 'player';
+  const tableId = payload.tableId || null;
+  const entryCents = Number(payload.entryCents || 0);
+  const wagerCents = Number(payload.wagerCents || 0);
+  const isPrivate = !!payload.private;
+  const roomCode = payload.roomCode ? String(payload.roomCode).trim().toUpperCase() : null;
+
+  let table = null;
+  if (tableId) {
+    table = await loadTable(tableId);
+  } else {
+    if (!Number.isInteger(entryCents) || !Number.isInteger(wagerCents) || entryCents < 0 || wagerCents < 0) {
+      return { ok: false, code: 'bad_stake' };
     }
+    table = await findOrCreateOpenTable(entryCents, wagerCents, isPrivate, roomCode);
   }
-  return null;
+
+  const tableMinWager = table.entry_fee_cents > 0 ? Math.max(table.min_wager_cents, table.entry_fee_cents * 2) : 0;
+  const wagerForSeat = Number(payload.wagerCents ?? tableMinWager);
+
+  const memberships = await loadMemberships(table.id);
+  const existing = memberships.find((m) => m.user_id === user.id);
+  const playerSeats = memberships.filter((m) => m.role === 'player').map((m) => m.seat_no).filter(Boolean);
+
+  const profile = await ensureProfile(user);
+
+  if (role === 'player') {
+    if (table.entry_fee_cents > 0 && (!Number.isInteger(wagerForSeat) || wagerForSeat < tableMinWager)) {
+      return { ok: false, code: 'min_wager_not_met' };
+    }
+
+    let seatNo = null;
+    if (existing?.role === 'player' && existing.seat_no) {
+      seatNo = existing.seat_no;
+    } else {
+      for (let i = 1; i <= 4; i += 1) {
+        if (!playerSeats.includes(i)) {
+          seatNo = i;
+          break;
+        }
+      }
+    }
+
+    if (!seatNo) {
+      return { ok: false, code: 'table_full' };
+    }
+
+    const alreadyPaid = existing && existing.role === 'player' && existing.paid_wager_cents > 0;
+    const stake = alreadyPaid ? 0 : table.entry_fee_cents + wagerForSeat;
+    if (stake > 0) {
+      const debit = await updateBalance(user.id, -stake);
+      if (!debit.ok) {
+        return { ok: false, code: 'insufficient_balance' };
+      }
+      await supabase.from('table_pot_contributions').insert({
+        table_id: table.id,
+        user_id: user.id,
+        amount_cents: stake,
+        source: 'buy_in',
+      });
+      await supabase
+        .from('tables')
+        .update({ pot_cents: (table.pot_cents || 0) + stake })
+        .eq('id', table.id);
+      table.pot_cents = (table.pot_cents || 0) + stake;
+    }
+
+    const nextPaidEntry = alreadyPaid ? existing.paid_entry_cents : table.entry_fee_cents;
+    const nextPaidWager = alreadyPaid ? existing.paid_wager_cents : wagerForSeat;
+    const nextContrib = (existing?.contributed_cents || 0) + stake;
+
+    await supabase.from('table_memberships').upsert(
+      {
+        table_id: table.id,
+        user_id: user.id,
+        role: 'player',
+        seat_no: seatNo,
+        paid_entry_cents: nextPaidEntry,
+        paid_wager_cents: nextPaidWager,
+        contributed_cents: nextContrib,
+        active: true,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'table_id,user_id' },
+    );
+  } else {
+    await supabase.from('table_memberships').upsert(
+      {
+        table_id: table.id,
+        user_id: user.id,
+        role: 'spectator',
+        seat_no: null,
+        active: true,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'table_id,user_id' },
+    );
+  }
+
+  sendToUser(user.id, {
+    type: 'joined_table',
+    tableId: table.id,
+    role,
+    tableName: table.name,
+    entryCents: table.entry_fee_cents,
+    minWagerCents: tableMinWager,
+    potCents: table.pot_cents,
+    displayName: profile.display_name,
+  });
+
+  await maybeStartGame(table.id);
+  await broadcastTableState(table.id);
+  return { ok: true, tableId: table.id };
 }
 
 const app = express();
@@ -380,252 +719,300 @@ app.use(cors({ origin: APP_ORIGIN }));
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, network: 'base-sepolia', mode: 'offchain-ledger-with-l2-cashout' });
+  res.json({ ok: true, mode: 'supabase-backed' });
 });
 
-app.post('/auth/challenge', (req, res) => {
-  const wallet = String(req.body.wallet || '').toLowerCase();
-  if (!wallet || !wallet.startsWith('0x')) {
-    res.status(400).json({ error: 'bad_wallet' });
+async function requireAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'missing_auth' });
     return;
   }
-
-  const nonce = uuidv4();
-  nonces.set(wallet, nonce);
-  res.json({ nonce, message: `Sign in to Tien Len: ${nonce}` });
-});
-
-app.post('/auth/verify', (req, res) => {
-  const wallet = String(req.body.wallet || '').toLowerCase();
-  const signature = String(req.body.signature || '');
-  const nonce = String(req.body.nonce || '');
-  const displayName = String(req.body.displayName || 'Player').slice(0, 20);
-
-  if (nonces.get(wallet) !== nonce) {
-    res.status(400).json({ error: 'bad_nonce' });
+  const token = auth.slice(7);
+  const user = await getUserFromToken(token);
+  if (!user) {
+    res.status(401).json({ error: 'bad_auth' });
     return;
   }
+  req.authUser = user;
+  next();
+}
 
-  const message = `Sign in to Tien Len: ${nonce}`;
-  let verifiedWallet = '';
-
+app.get('/auth/me', requireAuth, async (req, res) => {
   try {
-    verifiedWallet = ethers.verifyMessage(message, signature).toLowerCase();
-  } catch (_error) {
-    verifiedWallet = '';
+    const profile = await ensureProfile(req.authUser);
+    res.json({
+      userId: req.authUser.id,
+      email: req.authUser.email,
+      displayName: profile.display_name,
+      balanceCents: profile.balance_cents,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'profile_failed', detail: String(error.message || error) });
   }
-
-  // Demo fallback for Expo Go without wallet SDK.
-  if (!verifiedWallet && signature === `demo:${wallet}:${nonce}`) {
-    verifiedWallet = wallet;
-  }
-
-  if (verifiedWallet !== wallet) {
-    res.status(401).json({ error: 'bad_signature' });
-    return;
-  }
-
-  const playerId = sessions.get(wallet)?.playerId || uuidv4();
-  const token = jwt.sign({ playerId, wallet }, JWT_SECRET, { expiresIn: '7d' });
-
-  sessions.set(wallet, { playerId, wallet, displayName, token });
-  if (!balances.has(playerId)) {
-    balances.set(playerId, 0);
-  }
-
-  res.json({ token, playerId, wallet, displayName, balanceCents: balances.get(playerId) || 0 });
 });
 
-app.get('/wallet/me', requireAuth, (req, res) => {
-  res.json({ playerId: req.playerId, wallet: req.wallet, balanceCents: balances.get(req.playerId) || 0 });
+app.post('/profile', requireAuth, async (req, res) => {
+  try {
+    const displayName = String(req.body.displayName || 'Player').slice(0, 20);
+    const { data, error } = await supabase
+      .from('player_profiles')
+      .update({ display_name: displayName })
+      .eq('user_id', req.authUser.id)
+      .select('*')
+      .single();
+    if (error) throw error;
+    res.json({ displayName: data.display_name, balanceCents: data.balance_cents });
+  } catch (error) {
+    res.status(500).json({ error: 'profile_update_failed', detail: String(error.message || error) });
+  }
 });
 
-app.post('/wallet/deposit/mock', requireAuth, (req, res) => {
-  const amountCents = Number(req.body.amountCents || 0);
-  if (!Number.isInteger(amountCents) || amountCents <= 0) {
-    res.status(400).json({ error: 'bad_amount' });
-    return;
+app.post('/wallet/deposit/mock', requireAuth, async (req, res) => {
+  try {
+    const amountCents = Number(req.body.amountCents || 0);
+    if (!Number.isInteger(amountCents) || amountCents <= 0) {
+      res.status(400).json({ error: 'bad_amount' });
+      return;
+    }
+    const result = await updateBalance(req.authUser.id, amountCents);
+    if (!result.ok) {
+      res.status(400).json({ error: result.code });
+      return;
+    }
+    res.json({ balanceCents: result.balanceCents });
+  } catch (error) {
+    res.status(500).json({ error: 'deposit_failed', detail: String(error.message || error) });
   }
-
-  balances.set(req.playerId, (balances.get(req.playerId) || 0) + amountCents);
-  res.json({ balanceCents: balances.get(req.playerId) || 0 });
 });
 
-app.post('/wallet/cashout/quote', requireAuth, (req, res) => {
-  const amountCents = Number(req.body.amountCents || 0);
-  const chain = String(req.body.chain || 'base');
-  if (!Number.isInteger(amountCents) || amountCents <= 0) {
-    res.status(400).json({ error: 'bad_amount' });
-    return;
+app.get('/tables', async (_req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('tables')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(50);
+    if (error) throw error;
+
+    const payload = await Promise.all(
+      (data || []).map(async (table) => {
+        const members = await loadMemberships(table.id);
+        const players = members.filter((m) => m.role === 'player').length;
+        const spectators = members.filter((m) => m.role === 'spectator').length;
+        return {
+          id: table.id,
+          name: table.name,
+          private: table.is_private,
+          roomCode: table.room_code,
+          entryCents: table.entry_fee_cents,
+          minWagerCents: table.min_wager_cents,
+          potCents: table.pot_cents,
+          players,
+          spectators,
+          status: table.status,
+          tournamentId: table.tournament_id,
+          bracket: table.bracket,
+          roundNo: table.round_no,
+        };
+      }),
+    );
+
+    res.json({ tables: payload });
+  } catch (error) {
+    res.status(500).json({ error: 'tables_failed', detail: String(error.message || error) });
   }
-
-  const fixedFeeCents = 2;
-  const variableFee = Math.ceil(amountCents * 0.0015);
-  const feeCents = Math.max(fixedFeeCents, variableFee);
-
-  res.json({
-    chain,
-    amountCents,
-    feeCents,
-    receiveCents: Math.max(0, amountCents - feeCents),
-    note: 'Cashout runs on low-fee L2. In-game transfers stay off-chain and free.',
-  });
 });
 
-app.post('/wallet/cashout/request', requireAuth, (req, res) => {
-  const amountCents = Number(req.body.amountCents || 0);
-  if (!Number.isInteger(amountCents) || amountCents <= 0) {
-    res.status(400).json({ error: 'bad_amount' });
-    return;
+app.post('/tables', requireAuth, async (req, res) => {
+  try {
+    const name = String(req.body.name || 'Custom Table').slice(0, 30);
+    const entryCents = Number(req.body.entryCents || 0);
+    const minWagerCents = Number(req.body.minWagerCents || 0);
+    const isPrivate = !!req.body.private;
+    const roomCode = isPrivate ? String(req.body.roomCode || uuidv4().slice(0, 6)).toUpperCase() : null;
+
+    if (!Number.isInteger(entryCents) || !Number.isInteger(minWagerCents) || entryCents < 0 || minWagerCents < 0) {
+      res.status(400).json({ error: 'bad_stake' });
+      return;
+    }
+
+    const minimum = entryCents > 0 ? Math.max(entryCents * 2, minWagerCents) : 0;
+    const { data, error } = await supabase
+      .from('tables')
+      .insert({
+        name,
+        is_private: isPrivate,
+        room_code: roomCode,
+        entry_fee_cents: entryCents,
+        min_wager_cents: minimum,
+        created_by: req.authUser.id,
+      })
+      .select('*')
+      .single();
+    if (error) throw error;
+
+    res.json({
+      id: data.id,
+      name: data.name,
+      private: data.is_private,
+      roomCode: data.room_code,
+      entryCents: data.entry_fee_cents,
+      minWagerCents: data.min_wager_cents,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'table_create_failed', detail: String(error.message || error) });
   }
-
-  const balance = balances.get(req.playerId) || 0;
-  if (balance < amountCents) {
-    res.status(400).json({ error: 'insufficient_balance' });
-    return;
-  }
-
-  const fixedFeeCents = 2;
-  const variableFee = Math.ceil(amountCents * 0.0015);
-  const feeCents = Math.max(fixedFeeCents, variableFee);
-  const net = Math.max(0, amountCents - feeCents);
-
-  balances.set(req.playerId, balance - amountCents);
-
-  res.json({
-    status: 'queued',
-    txMode: 'batched-l2-relayer',
-    netReceiveCents: net,
-    feeCents,
-    balanceCents: balances.get(req.playerId) || 0,
-  });
 });
 
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
 
-wss.on('connection', (socket, req) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
-  const token = url.searchParams.get('token') || '';
-
-  let playerId = '';
-  let wallet = '';
-
+wss.on('connection', async (socket, req) => {
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    playerId = payload.playerId;
-    wallet = payload.wallet;
-  } catch (_error) {
-    socket.close(4001, 'unauthorized');
-    return;
-  }
-
-  socketsByPlayer.set(playerId, socket);
-
-  socket.on('message', (raw) => {
-    let data = null;
-    try {
-      data = JSON.parse(String(raw));
-    } catch (_error) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const token = url.searchParams.get('token') || '';
+    const user = await getUserFromToken(token);
+    if (!user) {
+      socket.close(4001, 'unauthorized');
       return;
     }
+    await ensureProfile(user);
 
-    if (data.type === 'join_room') {
-      const displayName = String(data.displayName || 'Player').slice(0, 20);
-      const entryCents = Number(data.entryCents || 0);
-      const wagerCents = Number(data.wagerCents || 0);
-      const stakeCents = entryCents + wagerCents;
+    socketsByUser.set(user.id, socket);
 
-      if (!Number.isInteger(entryCents) || !Number.isInteger(wagerCents) || stakeCents <= 0) {
-        sendToPlayer(playerId, { type: 'error', code: 'bad_stake' });
+    socket.on('message', async (raw) => {
+      let msg = null;
+      try {
+        msg = JSON.parse(String(raw));
+      } catch (_error) {
         return;
       }
 
-      const stakeKey = `${entryCents}-${wagerCents}`;
-      let room = findOpenRoom(stakeKey);
-      if (!room) {
-        room = createRoom(stakeKey);
-      }
-
-      if (!room.players.has(playerId)) {
-        room.playerOrder.push(playerId);
-        room.players.set(playerId, {
-          playerId,
-          wallet,
-          name: displayName,
-          entryCents,
-          wagerCents,
-          cards: [],
-        });
-      }
-
-      room.playerOrder.forEach((id) => {
-        sendToPlayer(id, {
-          type: 'room_waiting',
-          roomId: room.id,
-          waitingFor: Math.max(0, 4 - room.playerOrder.length),
-          players: room.playerOrder.map((pid) => ({
-            playerId: pid,
-            name: room.players.get(pid).name,
-            wallet: room.players.get(pid).wallet,
-          })),
-        });
-      });
-
-      tryStartRoom(room);
-      return;
-    }
-
-    if (data.type === 'play') {
-      const room = [...rooms.values()].find((r) => r.players.has(playerId));
-      if (!room) {
-        return;
-      }
-      const cardIds = Array.isArray(data.cardIds) ? data.cardIds : [];
-      const result = applyPlay(room, playerId, cardIds);
-      if (!result.ok) {
-        sendToPlayer(playerId, { type: 'error', code: result.code });
-        return;
-      }
-      broadcastRoom(room);
-      return;
-    }
-
-    if (data.type === 'pass') {
-      const room = [...rooms.values()].find((r) => r.players.has(playerId));
-      if (!room) {
-        return;
-      }
-      const result = pass(room, playerId);
-      if (!result.ok) {
-        sendToPlayer(playerId, { type: 'error', code: result.code });
-        return;
-      }
-      broadcastRoom(room);
-      return;
-    }
-
-    if (data.type === 'chat') {
-      const text = String(data.text || '').trim().slice(0, 300);
-      if (!text) return;
-      const session = sessions.get(wallet);
-      const senderName = session ? session.displayName : 'Player';
-      // Broadcast to everyone in the same room as this player
-      const room = [...rooms.values()].find((r) => r.players.has(playerId));
-      if (room) {
-        for (const pid of room.players.keys()) {
-          sendToPlayer(pid, { type: 'chat', sender: senderName, text });
+      try {
+        if (msg.type === 'join_room') {
+          const result = await joinTableAs(user, msg, 'player');
+          if (!result.ok) sendToUser(user.id, { type: 'error', code: result.code });
+          return;
         }
-      }
-      return;
-    }
-  });
 
-  socket.on('close', () => {
-    if (socketsByPlayer.get(playerId) === socket) {
-      socketsByPlayer.delete(playerId);
-    }
-  });
+        if (msg.type === 'spectate_table') {
+          const result = await joinTableAs(user, msg, 'spectator');
+          if (!result.ok) sendToUser(user.id, { type: 'error', code: result.code });
+          return;
+        }
+
+        if (msg.type === 'switch_to_spectator') {
+          const tableId = String(msg.tableId || '');
+          if (!tableId) return;
+          await supabase
+            .from('table_memberships')
+            .update({ role: 'spectator', seat_no: null, updated_at: new Date().toISOString() })
+            .eq('table_id', tableId)
+            .eq('user_id', user.id)
+            .eq('active', true);
+          await broadcastTableState(tableId);
+          return;
+        }
+
+        if (msg.type === 'add_to_pot') {
+          const tableId = String(msg.tableId || '');
+          const amountCents = Number(msg.amountCents || 0);
+          if (!tableId || !Number.isInteger(amountCents) || amountCents <= 0) {
+            sendToUser(user.id, { type: 'error', code: 'bad_amount' });
+            return;
+          }
+
+          const memberships = await loadMemberships(tableId);
+          const mine = memberships.find((m) => m.user_id === user.id);
+          if (!mine) {
+            sendToUser(user.id, { type: 'error', code: 'not_in_table' });
+            return;
+          }
+
+          const debit = await updateBalance(user.id, -amountCents);
+          if (!debit.ok) {
+            sendToUser(user.id, { type: 'error', code: debit.code });
+            return;
+          }
+
+          await supabase.from('table_pot_contributions').insert({
+            table_id: tableId,
+            user_id: user.id,
+            amount_cents: amountCents,
+            source: mine.role === 'spectator' ? 'spectator_add' : 'extra',
+          });
+
+          await supabase
+            .from('table_memberships')
+            .update({ contributed_cents: (mine.contributed_cents || 0) + amountCents, updated_at: new Date().toISOString() })
+            .eq('id', mine.id);
+
+          const table = await loadTable(tableId);
+          await supabase
+            .from('tables')
+            .update({ pot_cents: (table.pot_cents || 0) + amountCents })
+            .eq('id', tableId);
+
+          await broadcastTableState(tableId);
+          return;
+        }
+
+        if (msg.type === 'play') {
+          const tableId = String(msg.tableId || '');
+          if (!tableId) return;
+          const runtime = getRuntime(tableId);
+          const cardIds = Array.isArray(msg.cardIds) ? msg.cardIds : [];
+          const result = applyPlay(runtime, user.id, cardIds);
+          if (!result.ok) {
+            sendToUser(user.id, { type: 'error', code: result.code });
+            return;
+          }
+          if (result.finished) {
+            await settleGame(tableId, user.id);
+            return;
+          }
+          await broadcastTableState(tableId);
+          return;
+        }
+
+        if (msg.type === 'pass') {
+          const tableId = String(msg.tableId || '');
+          if (!tableId) return;
+          const runtime = getRuntime(tableId);
+          const result = applyPass(runtime, user.id);
+          if (!result.ok) {
+            sendToUser(user.id, { type: 'error', code: result.code });
+            return;
+          }
+          await broadcastTableState(tableId);
+          return;
+        }
+
+        if (msg.type === 'chat') {
+          const tableId = String(msg.tableId || '');
+          const text = String(msg.text || '').trim().slice(0, 300);
+          if (!tableId || !text) return;
+          const audience = await listRoomAudience(tableId);
+          const sender = audience.find((a) => a.userId === user.id)?.name || 'Player';
+          for (const person of audience) {
+            sendToUser(person.userId, { type: 'chat', sender, text });
+          }
+          return;
+        }
+      } catch (error) {
+        sendToUser(user.id, { type: 'error', code: 'server_error', detail: String(error.message || error) });
+      }
+    });
+
+    socket.on('close', () => {
+      if (socketsByUser.get(user.id) === socket) {
+        socketsByUser.delete(user.id);
+      }
+    });
+  } catch (_error) {
+    socket.close(4002, 'auth_failed');
+  }
 });
 
 httpServer.listen(PORT, () => {
